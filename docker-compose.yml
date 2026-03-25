@@ -1,0 +1,124 @@
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ipl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ipl}
+      POSTGRES_DB: ${POSTGRES_DB:-ipl_db}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ipl} -d ${POSTGRES_DB:-ipl_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: ["redis-server", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-ipl}:${POSTGRES_PASSWORD:-ipl}@postgres:5432/${POSTGRES_DB:-ipl_db}
+      REDIS_URL: redis://redis:6379/0
+      # External APIs (optional)
+      CRICKET_API_KEY: ${CRICKET_API_KEY:-}
+      ODDS_API_KEY: ${ODDS_API_KEY:-}
+      ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+      # MLflow (optional)
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_BACKEND_URL: http://localhost:8000
+      INTERNAL_BACKEND_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  etl:
+    build: ./etl
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-ipl}:${POSTGRES_PASSWORD:-ipl}@postgres:5432/${POSTGRES_DB:-ipl_db}
+      CRICKET_API_KEY: ${CRICKET_API_KEY:-}
+      ODDS_API_KEY: ${ODDS_API_KEY:-}
+      ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes: 
+      - ./data:/data
+    profiles: ["ops"]
+  
+
+  trainer:
+    build: ./ml
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-ipl}:${POSTGRES_PASSWORD:-ipl}@postgres:5432/${POSTGRES_DB:-ipl_db}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+      - ./ml/artifacts:/app/ml/artifacts
+    profiles: ["ml"]
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ipl_mlflow
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root /mlruns
+      --allowed-hosts "localhost:5000,127.0.0.1:5000,mlflow:5000"
+      --cors-allowed-origins "http://localhost:3000,http://localhost:5000"
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./ml/mlruns:/mlruns
+      - ./ml/mlflow:/mlflow
+    profiles: ["ml"]
+
+  scheduler:
+    build: ./etl
+    command: ["python", "-m", "etl.cli", "schedule"]
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-ipl}:${POSTGRES_PASSWORD:-ipl}@postgres:5432/${POSTGRES_DB:-ipl_db}
+      CRICKET_API_KEY: ${CRICKET_API_KEY:-}
+      ODDS_API_KEY: ${ODDS_API_KEY:-}
+      ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["ops"]
+
+volumes:
+  pg_data:
+  redis_data:
+  mlflow_artifacts:
