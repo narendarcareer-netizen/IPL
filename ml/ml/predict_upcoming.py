@@ -1,12 +1,20 @@
+import json
 import os
+
 import joblib
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+from ml.feature_config import (
+    STAGES,
+    feature_columns_for_stage,
+    model_artifact_for_stage,
+    model_name_for_stage,
+    normalize_stage,
+    upcoming_output_for_stage,
+)
 
-MODEL_PATH = "/app/ml/artifacts/logreg_prematch.joblib"
-FEATURES_PATH = "/app/ml/artifacts/upcoming_match_features.csv"
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 
 def get_latest_model_version_id(engine, model_name: str) -> int:
@@ -28,26 +36,30 @@ def get_latest_model_version_id(engine, model_name: str) -> int:
     return int(row[0])
 
 
-def main():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
+def predict_stage(engine, stage: str) -> int:
+    stage = normalize_stage(stage)
+    model_path = model_artifact_for_stage(stage)
+    features_path = upcoming_output_for_stage(stage)
+    model_name = model_name_for_stage(stage)
 
-    if not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(f"Upcoming features file not found: {FEATURES_PATH}")
+    if not os.path.exists(model_path):
+        print(f"Skipping {stage}: model file not found at {model_path}")
+        return 0
+    if not os.path.exists(features_path):
+        print(f"Skipping {stage}: upcoming features file not found at {features_path}")
+        return 0
 
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    df = pd.read_csv(features_path)
+    if df.empty:
+        print(f"Skipping {stage}: no upcoming rows available")
+        return 0
 
-    payload = joblib.load(MODEL_PATH)
+    payload = joblib.load(model_path)
     model = payload["model"]
-    trained_feature_cols = payload["feature_cols"]
-
-    model_name = "logreg_prematch"
+    trained_feature_cols = payload.get("feature_cols", feature_columns_for_stage(stage))
     model_version_id = get_latest_model_version_id(engine, model_name)
 
-    df = pd.read_csv(FEATURES_PATH)
-
     X = df[trained_feature_cols].fillna(0.0)
-
     probs = model.predict_proba(X)[:, 1]
     confidence = abs(probs - 0.5) * 2.0
 
@@ -60,6 +72,22 @@ def main():
     with engine.begin() as conn:
         for _, row in out.iterrows():
             cutoff_time_utc = pd.to_datetime(row["start_time_utc"], utc=True).to_pydatetime()
+            bookmaker_prob_team1 = row.get("bookmaker_prob_team1")
+            bookmaker_prob_team1 = None if pd.isna(bookmaker_prob_team1) else float(bookmaker_prob_team1)
+            bookmaker_prob_team2 = None
+            model_edge_team1 = None
+            model_edge_team2 = None
+
+            if bookmaker_prob_team1 is not None:
+                bookmaker_prob_team2 = float(1.0 - bookmaker_prob_team1)
+                model_edge_team1 = float(row["team1_win_prob"] - bookmaker_prob_team1)
+                model_edge_team2 = float(row["team2_win_prob"] - bookmaker_prob_team2)
+
+            feature_payload = {
+                column: float(row[column])
+                for column in trained_feature_cols
+                if column in row and pd.notna(row[column])
+            }
 
             conn.execute(
                 text("""
@@ -99,45 +127,43 @@ def main():
                 {
                     "match_id": int(row["match_id"]),
                     "model_version_id": model_version_id,
-                    "stage": "pre_toss",
+                    "stage": stage,
                     "cutoff_time_utc": cutoff_time_utc,
                     "team1_win_prob": float(row["team1_win_prob"]),
                     "team2_win_prob": float(row["team2_win_prob"]),
-                    "bookmaker_prob_team1": None,
-                    "bookmaker_prob_team2": None,
-                    "model_edge_team1": None,
-                    "model_edge_team2": None,
+                    "bookmaker_prob_team1": bookmaker_prob_team1,
+                    "bookmaker_prob_team2": bookmaker_prob_team2,
+                    "model_edge_team1": model_edge_team1,
+                    "model_edge_team2": model_edge_team2,
                     "confidence_score": float(row["confidence_score"]),
-                    "features_json": pd.Series({
-                        "elo_diff": row.get("elo_diff"),
-                        "batting_strength_diff": row.get("batting_strength_diff"),
-                        "bowling_strength_diff": row.get("bowling_strength_diff"),
-                        "all_rounder_balance_diff": row.get("all_rounder_balance_diff"),
-                        "spin_strength_diff": row.get("spin_strength_diff"),
-                        "pace_strength_diff": row.get("pace_strength_diff"),
-                        "death_overs_strength_diff": row.get("death_overs_strength_diff"),
-                        "probable_xi_batting_form_diff": row.get("probable_xi_batting_form_diff"),
-                        "probable_xi_bowling_form_diff": row.get("probable_xi_bowling_form_diff"),
-                        "probable_xi_runs_avg_diff": row.get("probable_xi_runs_avg_diff"),
-                        "probable_xi_sr_diff": row.get("probable_xi_sr_diff"),
-                        "probable_xi_wkts_diff": row.get("probable_xi_wkts_diff"),
-                        "probable_xi_econ_diff": row.get("probable_xi_econ_diff"),
-                    }).dropna().to_json(),
+                    "features_json": json.dumps(feature_payload),
                     "model_name": row["model_name"],
                 },
             )
 
-    print(out[[
+    preview_cols = [
         "match_id",
+        "stage",
         "team1_name",
         "team2_name",
         "team1_win_prob",
         "team2_win_prob",
         "confidence_score",
+        "bookmaker_prob_team1",
         "model_name",
-    ]].head(20).to_string(index=False))
+    ]
+    preview_cols = [column for column in preview_cols if column in out.columns]
+    print(out[preview_cols].head(20).to_string(index=False))
+    print(f"\nInserted {stage} predictions for {len(out)} matches")
+    return int(len(out))
 
-    print(f"\nInserted predictions for {len(out)} matches")
+
+def main():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    total = 0
+    for stage in STAGES:
+        total += predict_stage(engine, stage)
+    print(f"\nInserted predictions across stages for {total} rows")
 
 
 if __name__ == "__main__":

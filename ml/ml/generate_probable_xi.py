@@ -1,198 +1,222 @@
 import os
+from datetime import timezone
+
 import pandas as pd
 from sqlalchemy import create_engine, text
+
+from ml.feature_builder import (
+    build_candidate_rows,
+    classify_pitch,
+    prepare_context,
+    select_lineup,
+)
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 
+def build_candidate_pool(context, team_id: int, season: int, cutoff_time_utc: pd.Timestamp) -> list[int]:
+    squad_frame = context.squads_by_team_season.get((int(season), int(team_id)), pd.DataFrame())
+    squad_ids = squad_frame["player_id"].dropna().astype(int).tolist() if not squad_frame.empty else []
+
+    history_frame = context.player_history_by_team.get(int(team_id), pd.DataFrame())
+    if history_frame.empty or "start_time_utc" not in history_frame.columns:
+        return sorted(set(squad_ids))
+
+    recent_team_history = history_frame[history_frame["start_time_utc"] < cutoff_time_utc].sort_values(
+        "start_time_utc",
+        ascending=False,
+    )
+    recent_player_ids = recent_team_history["player_id"].dropna().astype(int).drop_duplicates().head(18).tolist()
+    return sorted(set(squad_ids).union(recent_player_ids))
+
+
+def add_continuity_boosts(context, team_id: int, cutoff_time_utc: pd.Timestamp, candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates
+
+    history_frame = context.player_history_by_team.get(int(team_id), pd.DataFrame())
+    if history_frame.empty or "start_time_utc" not in history_frame.columns:
+        candidates["continuity_boost"] = 0.0
+        candidates["played_last_match"] = False
+        return candidates
+
+    recent = history_frame[history_frame["start_time_utc"] < cutoff_time_utc].sort_values(
+        "start_time_utc",
+        ascending=False,
+    )
+    if recent.empty:
+        candidates["continuity_boost"] = 0.0
+        candidates["played_last_match"] = False
+        return candidates
+
+    last_match_id = recent.iloc[0]["match_id"]
+    appearance_last_8 = recent.head(120).groupby("player_id").size().to_dict()
+    appearance_last_3_matches = (
+        recent.drop_duplicates(subset=["match_id"]).head(3)["match_id"].tolist()
+    )
+    recent_last_3 = recent[recent["match_id"].isin(appearance_last_3_matches)]
+    appearance_last_3 = recent_last_3.groupby("player_id").size().to_dict()
+    last_seen = recent.groupby("player_id")["start_time_utc"].max().to_dict()
+
+    boosts = []
+    played_last_flags = []
+    for _, row in candidates.iterrows():
+        player_id = int(row["player_id"])
+        boost = 0.0
+        boost += 0.80 * min(appearance_last_8.get(player_id, 0), 8)
+        boost += 1.40 * min(appearance_last_3.get(player_id, 0), 3)
+        played_last = bool(
+            not recent[(recent["player_id"] == player_id) & (recent["match_id"] == last_match_id)].empty
+        )
+        if played_last:
+            boost += 2.0
+        last_seen_time = last_seen.get(player_id)
+        if last_seen_time is not None:
+            gap_days = max(0.0, (cutoff_time_utc - last_seen_time).total_seconds() / 86400.0)
+            boost += max(0.0, 10.0 - min(gap_days, 10.0)) * 0.18
+        role = row.get("role")
+        if role == "wk_batter":
+            boost += 0.5
+        if role == "all_rounder":
+            boost += 0.35
+        boosts.append(boost)
+        played_last_flags.append(played_last)
+
+    candidates = candidates.copy()
+    candidates["continuity_boost"] = boosts
+    candidates["played_last_match"] = played_last_flags
+    candidates["combined_score"] = candidates["combined_score"] + candidates["continuity_boost"]
+    return candidates
+
+
+def assign_batting_order(lineup: pd.DataFrame) -> pd.DataFrame:
+    if lineup.empty:
+        return lineup
+
+    lineup = lineup.copy()
+    batting_role_priority = {
+        "wk_batter": 1,
+        "batter": 1,
+        "all_rounder": 2,
+        "bowler": 3,
+    }
+    lineup["batting_sort"] = lineup["role"].map(batting_role_priority).fillna(4)
+    lineup["batting_score"] = (
+        0.65 * lineup["batting_form_score"].fillna(0)
+        + 0.20 * lineup["batting_runs_avg"].fillna(0)
+        + 0.10 * (lineup["batting_strike_rate"].fillna(0) / 100.0)
+        + 0.05 * (lineup["batting_boundary_pct"].fillna(0) * 100.0)
+    )
+    lineup = lineup.sort_values(
+        ["batting_sort", "batting_score", "combined_score"],
+        ascending=[True, False, False],
+    ).reset_index(drop=True)
+    lineup["batting_order_hint"] = range(1, len(lineup) + 1)
+    return lineup
+
+
+def choose_captain(lineup: pd.DataFrame) -> int | None:
+    if lineup.empty:
+        return None
+    candidates = lineup.copy()
+    candidates["captain_score"] = (
+        0.55 * candidates["recent_matches_used"].fillna(0)
+        + 0.25 * candidates["combined_score"].fillna(0)
+        + 0.20 * candidates["continuity_boost"].fillna(0)
+    )
+    preferred = candidates[candidates["role"].isin(["all_rounder", "batter", "wk_batter"])]
+    if not preferred.empty:
+        candidates = preferred
+    return int(candidates.sort_values("captain_score", ascending=False).iloc[0]["player_id"])
+
+
 def main():
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-
-    matches_q = text("""
-        SELECT
-            match_id,
-            team1_id,
-            team2_id,
-            start_time_utc
-        FROM matches
-        WHERE competition = 'Indian Premier League'
-          AND completed = false
-        ORDER BY start_time_utc ASC, match_id ASC
-        LIMIT 50
-    """)
-
-    matches_df = pd.read_sql(matches_q, engine)
+    context = prepare_context(engine)
+    matches_df = context.upcoming_matches.sort_values(["start_time_utc", "match_id"]).head(50).copy()
 
     if matches_df.empty:
-        print("No future IPL matches found to generate probable XI for.")
+        print("No future IPL matches found.")
         return
-
-    players_q = text("""
-        WITH squad_pool AS (
-            SELECT
-                s.season,
-                s.team_id,
-                s.player_id,
-                COALESCE(s.role, 'unknown') AS squad_role,
-                COALESCE(s.is_overseas, false) AS is_overseas
-            FROM squads s
-            WHERE s.season = 2026
-        ),
-        recent_usage AS (
-            SELECT
-                pms.team_id,
-                pms.player_id,
-                COUNT(*) AS recent_matches_used,
-                MAX(m.start_time_utc) AS last_match_time
-            FROM player_match_stats pms
-            JOIN matches m
-              ON pms.match_id = m.match_id
-            WHERE m.competition = 'Indian Premier League'
-              AND m.completed = true
-            GROUP BY pms.team_id, pms.player_id
-        ),
-        latest_player_form AS (
-            SELECT DISTINCT ON (player_id)
-                player_id,
-                COALESCE(batting_form_score, 0) AS batting_form_score,
-                COALESCE(bowling_form_score, 0) AS bowling_form_score,
-                COALESCE(batting_runs_avg, 0) AS batting_runs_avg,
-                COALESCE(bowling_wkts_avg, 0) AS bowling_wkts_avg
-            FROM player_form_snapshots
-            ORDER BY player_id, as_of_time_utc DESC
-        )
-        SELECT
-            sp.team_id,
-            sp.player_id,
-            sp.squad_role,
-            sp.is_overseas,
-            COALESCE(ru.recent_matches_used, 0) AS recent_matches_used,
-            ru.last_match_time,
-            COALESCE(lpf.batting_form_score, 0) AS batting_form_score,
-            COALESCE(lpf.bowling_form_score, 0) AS bowling_form_score,
-            COALESCE(lpf.batting_runs_avg, 0) AS batting_runs_avg,
-            COALESCE(lpf.bowling_wkts_avg, 0) AS bowling_wkts_avg
-        FROM squad_pool sp
-        LEFT JOIN recent_usage ru
-          ON sp.team_id = ru.team_id
-         AND sp.player_id = ru.player_id
-        LEFT JOIN latest_player_form lpf
-          ON sp.player_id = lpf.player_id
-    """)
-
-    players_df = pd.read_sql(players_q, engine)
-
-    if players_df.empty:
-        print("No 2026 squad/player data found.")
-        return
-
-    players_df["combined_score"] = (
-        0.35 * players_df["batting_form_score"].fillna(0)
-        + 0.25 * players_df["bowling_form_score"].fillna(0)
-        + 0.15 * players_df["batting_runs_avg"].fillna(0)
-        + 0.15 * players_df["bowling_wkts_avg"].fillna(0)
-        + 2.00 * players_df["recent_matches_used"].fillna(0)
-    )
 
     rows = []
+    for _, match_row in matches_df.iterrows():
+        match_id = int(match_row["match_id"])
+        pitch_type = classify_pitch(context.venue_names.get(match_row.get("venue_id"), ""))
+        as_of_time_utc = pd.to_datetime(match_row["start_time_utc"], utc=True).to_pydatetime()
+        season = int(match_row["season"])
 
-    for _, m in matches_df.iterrows():
-        match_id = int(m["match_id"])
-        as_of_time_utc = pd.to_datetime(m["start_time_utc"], utc=True).to_pydatetime()
-
-        for team_id in [int(m["team1_id"]), int(m["team2_id"])]:
-            team_players = players_df[players_df["team_id"] == team_id].copy()
-
-            if team_players.empty:
+        for team_id in [int(match_row["team1_id"]), int(match_row["team2_id"])]:
+            player_ids = build_candidate_pool(
+                context=context,
+                team_id=team_id,
+                season=season,
+                cutoff_time_utc=match_row["start_time_utc"],
+            )
+            if not player_ids:
                 continue
 
-            selected = []
+            candidates = build_candidate_rows(
+                context=context,
+                team_id=team_id,
+                season=season,
+                cutoff_time_utc=match_row["start_time_utc"],
+                pitch_type=pitch_type,
+                player_ids=player_ids,
+            )
+            candidates = add_continuity_boosts(
+                context=context,
+                team_id=team_id,
+                cutoff_time_utc=match_row["start_time_utc"],
+                candidates=candidates,
+            )
 
-            # 1 wicketkeeper if possible
-            wk = team_players[team_players["squad_role"].isin(["wk_batter"])] \
-                .sort_values("combined_score", ascending=False).head(1)
-            if not wk.empty:
-                selected.append(wk.iloc[0]["player_id"])
+            lineup = select_lineup(candidates, pitch_type)
+            lineup = assign_batting_order(lineup)
+            captain_id = choose_captain(lineup)
 
-            # 3 more batters / wk-batters
-            batters = team_players[
-                team_players["squad_role"].isin(["batter", "wk_batter"])
-                & ~team_players["player_id"].isin(selected)
-            ].sort_values("combined_score", ascending=False).head(3)
-            selected.extend(batters["player_id"].tolist())
+            wk_candidates = lineup[lineup["role"] == "wk_batter"].copy()
+            wicketkeeper_id = None
+            if not wk_candidates.empty:
+                wicketkeeper_id = int(wk_candidates.sort_values("combined_score", ascending=False).iloc[0]["player_id"])
+            elif not lineup.empty:
+                wicketkeeper_id = int(lineup.sort_values("batting_score", ascending=False).iloc[0]["player_id"])
 
-            # 2 all-rounders
-            all_rounders = team_players[
-                (team_players["squad_role"] == "all_rounder")
-                & ~team_players["player_id"].isin(selected)
-            ].sort_values("combined_score", ascending=False).head(2)
-            selected.extend(all_rounders["player_id"].tolist())
+            confidence = min(
+                0.95,
+                0.58
+                + 0.02 * lineup["recent_matches_used"].fillna(0).mean()
+                + 0.03 * lineup["played_last_match"].fillna(False).mean(),
+            )
 
-            # 4 bowlers
-            bowlers = team_players[
-                (team_players["squad_role"] == "bowler")
-                & ~team_players["player_id"].isin(selected)
-            ].sort_values("combined_score", ascending=False).head(4)
-            selected.extend(bowlers["player_id"].tolist())
-
-            # fill remaining spots by best score
-            remaining_needed = 11 - len(selected)
-            if remaining_needed > 0:
-                fillers = team_players[
-                    ~team_players["player_id"].isin(selected)
-                ].sort_values("combined_score", ascending=False).head(remaining_needed)
-                selected.extend(fillers["player_id"].tolist())
-
-            # cap to 4 overseas by swapping out lowest-scoring overseas extras
-            chosen = team_players[team_players["player_id"].isin(selected)].copy()
-            overseas_count = int(chosen["is_overseas"].sum())
-
-            if overseas_count > 4:
-                chosen = chosen.sort_values(["is_overseas", "combined_score"], ascending=[False, True])
-                overseas_to_remove = overseas_count - 4
-                remove_ids = chosen[chosen["is_overseas"]].head(overseas_to_remove)["player_id"].tolist()
-
-                selected = [pid for pid in selected if pid not in remove_ids]
-
-                local_fillers = team_players[
-                    (~team_players["is_overseas"])
-                    & (~team_players["player_id"].isin(selected))
-                ].sort_values("combined_score", ascending=False).head(overseas_to_remove)
-
-                selected.extend(local_fillers["player_id"].tolist())
-
-            final_df = team_players[team_players["player_id"].isin(selected)].copy()
-            final_df = final_df.sort_values("combined_score", ascending=False).head(11)
-
-            for rank, (_, r) in enumerate(final_df.iterrows(), start=1):
+            for _, player_row in lineup.iterrows():
                 rows.append({
                     "match_id": match_id,
                     "team_id": team_id,
-                    "player_id": int(r["player_id"]),
-                    "source": "squad_role_balanced_form",
+                    "player_id": int(player_row["player_id"]),
+                    "is_captain": int(player_row["player_id"]) == captain_id,
+                    "is_wicketkeeper": int(player_row["player_id"]) == wicketkeeper_id,
+                    "source": "xi_v4_recent_continuity",
                     "as_of_time_utc": as_of_time_utc,
-                    "batting_order_hint": rank,
-                    "confidence": 0.78,
+                    "batting_order_hint": int(player_row["batting_order_hint"]),
+                    "confidence": float(confidence),
                 })
 
     xi_df = pd.DataFrame(rows)
-
     if xi_df.empty:
-        print("No probable XI rows generated.")
+        print("No XI generated.")
         return
 
     with engine.begin() as conn:
-        conn.execute(
-            text("""
-                DELETE FROM probable_xi
-                WHERE match_id IN (
-                    SELECT match_id
-                    FROM matches
-                    WHERE competition = 'Indian Premier League'
-                      AND completed = false
-                )
-            """)
-        )
+        conn.execute(text("""
+            DELETE FROM probable_xi
+            WHERE match_id IN (
+                SELECT match_id
+                FROM matches
+                WHERE competition = 'Indian Premier League'
+                  AND completed = false
+            )
+        """))
 
         for _, row in xi_df.iterrows():
             conn.execute(
@@ -201,6 +225,8 @@ def main():
                         match_id,
                         team_id,
                         player_id,
+                        is_captain,
+                        is_wicketkeeper,
                         source,
                         as_of_time_utc,
                         batting_order_hint,
@@ -210,6 +236,8 @@ def main():
                         :match_id,
                         :team_id,
                         :player_id,
+                        :is_captain,
+                        :is_wicketkeeper,
                         :source,
                         :as_of_time_utc,
                         :batting_order_hint,
@@ -219,7 +247,7 @@ def main():
                 row.to_dict(),
             )
 
-    print(f"Inserted probable XI rows: {len(xi_df)}")
+    print(f"Inserted XI rows: {len(xi_df)}")
     print(xi_df.head(20).to_string(index=False))
 
 

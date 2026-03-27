@@ -10,7 +10,7 @@ router = APIRouter()
 @router.get("/match/{match_id}")
 def predict_for_match(
     match_id: int,
-    stage: str = Query("pre_toss", pattern="^(pre_toss|post_toss|post_lineup)$"),
+    stage: str = Query("pre_toss", pattern="^(pre_toss|post_toss|post_lineup|confirmed_xi)$"),
     model_uri: str | None = Query(None),
     db: Session = Depends(get_db),
 ):
@@ -61,7 +61,14 @@ def list_predictions(
     return {"items": list(rows)}
  
 @router.get("/explanations/{match_id}")
-def get_explanations(match_id: int, db: Session = Depends(get_db)):
+def get_explanations(
+    match_id: int,
+    stage: str | None = Query(None, pattern="^(pre_toss|post_toss|post_lineup|confirmed_xi)?$"),
+    db: Session = Depends(get_db),
+):
+    normalized_stage = None
+    if stage:
+        normalized_stage = "confirmed_xi" if stage == "post_lineup" else stage
     row = db.execute(
         text("""
             SELECT e.top_features_json
@@ -69,10 +76,11 @@ def get_explanations(match_id: int, db: Session = Depends(get_db)):
             JOIN predictions p
               ON e.prediction_id = p.prediction_id
             WHERE p.match_id = :match_id
+              AND (:stage IS NULL OR p.stage = :stage)
             ORDER BY p.created_at_utc DESC, e.explanation_id DESC
             LIMIT 1
         """),
-        {"match_id": match_id},
+        {"match_id": match_id, "stage": normalized_stage},
     ).first()
 
     if not row:

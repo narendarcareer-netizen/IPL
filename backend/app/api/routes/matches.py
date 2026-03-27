@@ -22,7 +22,10 @@ def upcoming_matches(db: Session = Depends(get_db)):
       FROM matches m
       JOIN teams t1 ON m.team1_id = t1.team_id
       JOIN teams t2 ON m.team2_id = t2.team_id
-      ORDER BY m.start_time_utc DESC
+      WHERE m.competition = 'Indian Premier League'
+        AND COALESCE(m.completed, false) = false
+        AND m.start_time_utc >= NOW() - interval '1 day'
+      ORDER BY m.start_time_utc ASC
       LIMIT 50
     """)
     rows = db.execute(q).mappings().all()

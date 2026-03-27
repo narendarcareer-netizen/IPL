@@ -1,81 +1,108 @@
 import os
+import json
 from pathlib import Path
+
 import joblib
-import pandas as pd
 import mlflow
 import mlflow.sklearn
+import pandas as pd
+from sqlalchemy import create_engine, text
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-FEATURES_PATH = "/app/ml/artifacts/pre_match_features.csv"
-MODEL_PATH = "/app/ml/artifacts/logreg_prematch.joblib"
+from ml.feature_config import (
+    STAGES,
+    feature_columns_for_stage,
+    historical_output_for_stage,
+    model_artifact_for_stage,
+    model_name_for_stage,
+    normalize_stage,
+)
+
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 
-def main():
-    if not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(f"Features file not found: {FEATURES_PATH}")
+def register_model_version(
+    engine,
+    model_name: str,
+    stage: str,
+    run_id: str | None,
+    artifact_uri: str,
+    metrics: dict,
+) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO model_versions (
+                    model_name,
+                    stage,
+                    created_at_utc,
+                    mlflow_run_id,
+                    artifact_uri,
+                    metrics_json
+                )
+                VALUES (
+                    :model_name,
+                    :stage,
+                    NOW(),
+                    :mlflow_run_id,
+                    :artifact_uri,
+                    CAST(:metrics_json AS jsonb)
+                )
+            """),
+            {
+                "model_name": model_name,
+                "stage": stage,
+                "mlflow_run_id": run_id,
+                "artifact_uri": artifact_uri,
+                "metrics_json": json.dumps(metrics),
+            },
+        )
 
-    df = pd.read_csv(FEATURES_PATH)
 
-    print("CSV columns:")
-    print(df.columns.tolist())
+def train_stage(engine, stage: str) -> None:
+    stage = normalize_stage(stage)
+    features_path = historical_output_for_stage(stage)
+    model_path = model_artifact_for_stage(stage)
+    model_name = model_name_for_stage(stage)
+    feature_cols = feature_columns_for_stage(stage)
 
-    feature_cols = [
-    "elo_diff",
-    "batting_strength_diff",
-    "bowling_strength_diff",
-    "all_rounder_balance_diff",
-    "spin_strength_diff",
-    "pace_strength_diff",
-    "death_overs_strength_diff",
-    "venue_win_bias_diff",
-    "probable_xi_count_diff",
-    "probable_xi_batting_form_diff",
-    "probable_xi_bowling_form_diff",
-    "top_order_strength_diff",
-    "middle_order_strength_diff",
-    "death_bowling_strength_diff",
-]
+    if not os.path.exists(features_path):
+        print(f"Skipping {stage}: features file not found at {features_path}")
+        return
 
-    for bad_col in [
-        "winner_team_id",
-        "team1_won",
-        "match_id",
-        "start_time_utc",
-        "toss_winner_team_id",
-        "toss_decision",
-    ]:
-        if bad_col in feature_cols:
-            raise ValueError(f"Leakage column found in feature_cols: {bad_col}")
+    df = pd.read_csv(features_path)
+    if df.empty:
+        print(f"Skipping {stage}: no historical rows available")
+        return
 
-    missing = [c for c in feature_cols if c not in df.columns]
+    missing = [column for column in feature_cols if column not in df.columns]
     if missing:
-        raise ValueError(f"Missing feature columns: {missing}")
-
-    print("\nTraining sample:")
-    print(df[feature_cols + ["team1_won"]].head(10).to_string(index=False))
+        raise ValueError(f"Missing feature columns for {stage}: {missing}")
+    if "team1_won" not in df.columns:
+        raise ValueError(f"Historical features for {stage} must include team1_won")
 
     X = df[feature_cols].fillna(0.0)
     y = df["team1_won"].astype(int)
 
     suspicious = []
-    for col in feature_cols:
-        try:
-            corr = abs(pd.Series(X[col]).corr(y))
-            if pd.notna(corr) and corr > 0.98:
-                suspicious.append((col, corr))
-        except Exception:
-            pass
-
+    for column in feature_cols:
+        corr = abs(pd.Series(X[column]).corr(y))
+        if pd.notna(corr) and corr > 0.98:
+            suspicious.append((column, corr))
     if suspicious:
-        raise ValueError(f"Potential leakage: suspiciously high target correlation: {suspicious}")
+        raise ValueError(f"Potential leakage for {stage}: suspiciously high target correlation: {suspicious}")
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=False
-    )
+    split_idx = int(len(df) * 0.8)
+    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
-    model = LogisticRegression(max_iter=1000)
+    model = Pipeline([
+        ("scaler", StandardScaler()),
+        ("logreg", LogisticRegression(max_iter=2000, C=0.7)),
+    ])
     model.fit(X_train, y_train)
 
     probs = model.predict_proba(X_test)[:, 1]
@@ -85,39 +112,55 @@ def main():
     brier = brier_score_loss(y_test, probs)
     acc = accuracy_score(y_test, preds)
 
-    print(f"\nLog loss: {ll:.4f}")
-    print(f"Brier score: {brier:.4f}")
-    print(f"Accuracy: {acc:.4f}")
+    metrics = {
+        "log_loss": float(ll),
+        "brier_score": float(brier),
+        "accuracy": float(acc),
+    }
+
+    print(f"[{stage}] Log loss: {ll:.4f}")
+    print(f"[{stage}] Brier score: {brier:.4f}")
+    print(f"[{stage}] Accuracy: {acc:.4f}")
 
     Path("/app/ml/artifacts").mkdir(parents=True, exist_ok=True)
-    joblib.dump(
-        {
-            "model": model,
-            "feature_cols": feature_cols,
-            "metrics": {
-                "log_loss": ll,
-                "brier_score": brier,
-                "accuracy": acc,
-            },
-        },
-        MODEL_PATH,
-    )
-    print(f"Model saved to {MODEL_PATH}")
+    payload = {
+        "model": model,
+        "feature_cols": feature_cols,
+        "metrics": metrics,
+        "stage": stage,
+        "model_name": model_name,
+    }
+    joblib.dump(payload, model_path)
+    print(f"[{stage}] Model saved to {model_path}")
 
     mlflow.set_experiment("ipl_prediction")
-    with mlflow.start_run(run_name="logreg_prematch_leakcheck_v2"):
+    with mlflow.start_run(run_name=f"{model_name}_richer_features_v2") as run:
         mlflow.log_params({
             "model_type": "logistic_regression",
+            "stage": stage,
             "feature_count": len(feature_cols),
+            "scaled": True,
         })
-        mlflow.log_metrics({
-            "log_loss": ll,
-            "brier_score": brier,
-            "accuracy": acc,
-        })
+        mlflow.log_metrics(metrics)
         mlflow.sklearn.log_model(model, artifact_path="model")
 
-    print("Model logged to MLflow")
+        artifact_uri = f"{run.info.artifact_uri}/model"
+        register_model_version(
+            engine=engine,
+            model_name=model_name,
+            stage=stage,
+            run_id=run.info.run_id,
+            artifact_uri=artifact_uri,
+            metrics=metrics,
+        )
+
+    print(f"[{stage}] Model logged to MLflow and registered in model_versions")
+
+
+def main():
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    for stage in STAGES:
+        train_stage(engine, stage)
 
 
 if __name__ == "__main__":

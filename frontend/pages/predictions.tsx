@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
-import { listPredictions } from "../lib/api";
+import { getExplanations, getPrediction, listPredictions } from "../lib/api";
+import { PredictionInsightPanel } from "../components/PredictionCard";
 
 type PredictionRow = {
   prediction_id: number;
@@ -31,6 +32,8 @@ export default function PredictionsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [teamFilter, setTeamFilter] = useState("");
+  const [detailsByMatch, setDetailsByMatch] = useState<Record<number, any>>({});
+  const [loadingDetailMatch, setLoadingDetailMatch] = useState<number | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -57,6 +60,28 @@ export default function PredictionsPage() {
     );
   }, [items, teamFilter]);
 
+  async function loadDetails(matchId: number, stage: string) {
+    try {
+      setLoadingDetailMatch(matchId);
+      const [prediction, explanations] = await Promise.all([
+        getPrediction(matchId, stage || "pre_toss"),
+        getExplanations(matchId, stage || "pre_toss"),
+      ]);
+      setDetailsByMatch((current) => ({
+        ...current,
+        [matchId]: {
+          prediction,
+          explanations: explanations.items || [],
+        },
+      }));
+    } catch (err) {
+      console.error("Failed to load prediction details", err);
+      alert("Could not load explanation details for this match.");
+    } finally {
+      setLoadingDetailMatch(null);
+    }
+  }
+
   return (
     <main style={{ maxWidth: 1100, margin: "0 auto", padding: 24 }}>
       <div
@@ -72,7 +97,7 @@ export default function PredictionsPage() {
         <div>
           <h1 style={{ margin: 0 }}>IPL Prediction Dashboard</h1>
           <p style={{ marginTop: 8, color: "#555" }}>
-            Saved pre-toss model predictions from your local pipeline
+            Saved predictions with batting, bowling, venue, and player-form explanations
           </p>
         </div>
 
@@ -97,9 +122,7 @@ export default function PredictionsPage() {
       {loading && <p>Loading predictions...</p>}
       {error && <p style={{ color: "red" }}>{error}</p>}
 
-      {!loading && !error && filtered.length === 0 && (
-        <p>No predictions found.</p>
-      )}
+      {!loading && !error && filtered.length === 0 && <p>No predictions found.</p>}
 
       <div style={{ display: "grid", gap: 16 }}>
         {filtered.map((item) => {
@@ -131,7 +154,7 @@ export default function PredictionsPage() {
                     {item.team1_name} vs {item.team2_name}
                   </h2>
                   <div style={{ color: "#666", fontSize: 14 }}>
-                    Match #{item.match_id} • {item.stage} • {item.model_name}
+                    Match #{item.match_id} | {item.stage} | {item.model_name}
                   </div>
                   <div style={{ color: "#666", fontSize: 14, marginTop: 4 }}>
                     Starts: {item.start_time_utc}
@@ -153,6 +176,20 @@ export default function PredictionsPage() {
                       {confidenceLabel(item.confidence_score)} ({pct(item.confidence_score)})
                     </span>
                   </div>
+                  <button
+                    onClick={() => loadDetails(item.match_id, item.stage)}
+                    disabled={loadingDetailMatch === item.match_id}
+                    style={{
+                      marginTop: 10,
+                      border: "1px solid #d1d5db",
+                      borderRadius: 8,
+                      background: "#fff",
+                      padding: "8px 12px",
+                      cursor: "pointer",
+                    }}
+                  >
+                    {loadingDetailMatch === item.match_id ? "Loading..." : "Show explanation"}
+                  </button>
                 </div>
               </div>
 
@@ -243,6 +280,13 @@ export default function PredictionsPage() {
                 <span>Prediction created: {item.created_at_utc}</span>
                 <span>ID: {item.prediction_id}</span>
               </div>
+
+              {detailsByMatch[item.match_id] && (
+                <PredictionInsightPanel
+                  prediction={detailsByMatch[item.match_id].prediction}
+                  explanations={detailsByMatch[item.match_id].explanations}
+                />
+              )}
             </section>
           );
         })}

@@ -1,6 +1,7 @@
 import typer
 from etl.cricsheet import load_cricsheet
-from etl.odds import refresh_odds
+from etl.fixtures import sync_upcoming_fixtures_from_odds
+from etl.odds import backfill_historical_odds, refresh_odds
 from etl.lineups import refresh_lineups
 
 app = typer.Typer(help="ETL commands for local IPL predictor.")
@@ -12,6 +13,18 @@ def ingest_cricsheet(path: str):
 @app.command()
 def refresh_odds_cmd():
     refresh_odds()
+
+@app.command()
+def backfill_historical_odds_cmd(limit: int = 25, hours_before_start: int = 6, season_from: int = 2020):
+    backfill_historical_odds(
+        limit=limit,
+        hours_before_start=hours_before_start,
+        season_from=season_from,
+    )
+
+@app.command()
+def sync_upcoming_fixtures_cmd(delete_stale: bool = True):
+    sync_upcoming_fixtures_from_odds(delete_stale=delete_stale)
 
 @app.command()
 def refresh_lineups_cmd():

@@ -23,8 +23,12 @@ export async function getPrediction(matchId: number, stage: string, modelUri?: s
   return res.json();
 }
 
-export async function getExplanations(matchId: number) {
-  const res = await fetch(`${BACKEND_URL}/predictions/explanations/${matchId}`);
+export async function getExplanations(matchId: number, stage?: string) {
+  const url = new URL(`${BACKEND_URL}/predictions/explanations/${matchId}`);
+  if (stage) {
+    url.searchParams.set("stage", stage);
+  }
+  const res = await fetch(url.toString());
   if (!res.ok) {
     throw new Error(`Failed to fetch explanations: ${res.status}`);
   }

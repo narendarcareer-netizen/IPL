@@ -1,37 +1,25 @@
 import os
-import pandas as pd
+
 import mlflow
 import mlflow.xgboost
+import pandas as pd
+from sklearn.metrics import accuracy_score, brier_score_loss, log_loss
 from xgboost import XGBClassifier
-from sklearn.metrics import log_loss, brier_score_loss, accuracy_score
 
-FEATURES_PATH = "/app/ml/artifacts/pre_match_features.csv"
+from ml.feature_config import FEATURE_COLUMNS, HISTORICAL_OUTPUT_PATH
 
 
 def main():
-    if not os.path.exists(FEATURES_PATH):
-        raise FileNotFoundError(f"Features file not found: {FEATURES_PATH}")
+    if not os.path.exists(HISTORICAL_OUTPUT_PATH):
+        raise FileNotFoundError(f"Features file not found: {HISTORICAL_OUTPUT_PATH}")
 
-    df = pd.read_csv(FEATURES_PATH)
+    df = pd.read_csv(HISTORICAL_OUTPUT_PATH)
 
-    feature_cols = [
-    "elo_diff",
-    "batting_strength_diff",
-    "bowling_strength_diff",
-    "all_rounder_balance_diff",
-    "spin_strength_diff",
-    "pace_strength_diff",
-    "death_overs_strength_diff",
-    "venue_win_bias_diff",
-    "probable_xi_count_diff",
-    "probable_xi_batting_form_diff",
-    "probable_xi_bowling_form_diff",
-    "top_order_strength_diff",
-    "middle_order_strength_diff",
-    "death_bowling_strength_diff",
-]
+    missing = [column for column in FEATURE_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing feature columns: {missing}")
 
-    X = df[feature_cols].fillna(0.0)
+    X = df[FEATURE_COLUMNS].fillna(0.0)
     y = df["team1_won"].astype(int)
 
     split_idx = int(len(df) * 0.8)
@@ -39,17 +27,18 @@ def main():
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
 
     model = XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.03,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_lambda=1.0,
+        n_estimators=500,
+        max_depth=3,
+        learning_rate=0.025,
+        subsample=0.85,
+        colsample_bytree=0.8,
+        min_child_weight=4,
+        reg_lambda=1.5,
+        gamma=0.1,
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,
     )
-
     model.fit(X_train, y_train)
 
     probs = model.predict_proba(X_test)[:, 1]
@@ -64,16 +53,18 @@ def main():
     print(f"Accuracy: {acc:.4f}")
 
     mlflow.set_experiment("ipl_prediction")
-
-    with mlflow.start_run(run_name="xgb_prematch_baseline"):
+    with mlflow.start_run(run_name="xgb_prematch_richer_features_v1"):
         mlflow.log_params({
             "model_type": "xgboost",
-            "feature_count": len(feature_cols),
-            "n_estimators": 300,
-            "max_depth": 4,
-            "learning_rate": 0.03,
-            "subsample": 0.9,
-            "colsample_bytree": 0.9,
+            "feature_count": len(FEATURE_COLUMNS),
+            "n_estimators": 500,
+            "max_depth": 3,
+            "learning_rate": 0.025,
+            "subsample": 0.85,
+            "colsample_bytree": 0.8,
+            "min_child_weight": 4,
+            "reg_lambda": 1.5,
+            "gamma": 0.1,
         })
         mlflow.log_metrics({
             "log_loss": ll,

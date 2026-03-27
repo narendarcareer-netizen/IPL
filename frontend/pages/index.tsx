@@ -1,16 +1,15 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { getUpcomingMatches, getPrediction, getExplanations } from "../lib/api";
+import { PredictionInsightPanel } from "../components/PredictionCard";
 
 export default function Home() {
   const [matches, setMatches] = useState<any[]>([]);
   const [preds, setPreds] = useState<Record<string, any>>({});
+  const [stageByMatch, setStageByMatch] = useState<Record<number, string>>({});
   const [loadingMatches, setLoadingMatches] = useState(true);
   const [matchesError, setMatchesError] = useState<string | null>(null);
   const [loadingPredFor, setLoadingPredFor] = useState<number | null>(null);
-
-  const modelUriPre = "models:/ipl_winprob_xgb/Staging";
-
   useEffect(() => {
     (async () => {
       try {
@@ -29,16 +28,15 @@ export default function Home() {
   async function loadPred(matchId: number) {
     try {
       setLoadingPredFor(matchId);
+      const stage = stageByMatch[matchId] || "pre_toss";
 
-      const pre = await getPrediction(matchId, "pre_toss", modelUriPre);
-      const post = await getPrediction(matchId, "post_toss", modelUriPre);
-      const explanations = await getExplanations(matchId);
+      const pre = await getPrediction(matchId, stage);
+      const explanations = await getExplanations(matchId, stage);
 
       setPreds((p) => ({
         ...p,
         [matchId]: {
           pre,
-          post,
           explanations: explanations.items || [],
         },
       }));
@@ -85,6 +83,21 @@ export default function Home() {
             <div>Match #{m.match_id}</div>
             <div>Competition: {m.competition || "Indian Premier League"}</div>
             <div>Starts: {m.start_time_utc}</div>
+            <div style={{ marginTop: 8 }}>
+              <select
+                value={stageByMatch[m.match_id] || "pre_toss"}
+                onChange={(e) =>
+                  setStageByMatch((current) => ({
+                    ...current,
+                    [m.match_id]: e.target.value,
+                  }))
+                }
+              >
+                <option value="pre_toss">Pre Toss</option>
+                <option value="post_toss">Post Toss</option>
+                <option value="confirmed_xi">Confirmed XI</option>
+              </select>
+            </div>
 
             <button
               onClick={() => loadPred(m.match_id)}
@@ -95,43 +108,10 @@ export default function Home() {
             </button>
 
             {preds[m.match_id] && (
-              <div style={{ marginTop: 12 }}>
-                <div>Model: {preds[m.match_id].pre.model_name}</div>
-                <div>
-                  {preds[m.match_id].pre.team1_name} win prob:{" "}
-                  {Number(preds[m.match_id].pre.team1_win_prob).toFixed(3)}
-                </div>
-                <div>
-                  {preds[m.match_id].pre.team2_name} win prob:{" "}
-                  {Number(preds[m.match_id].pre.team2_win_prob).toFixed(3)}
-                </div>
-                <div>
-                  {preds[m.match_id].pre.team1_name} Elo:{" "}
-                  {Number(preds[m.match_id].pre.team1_rating).toFixed(1)}
-                </div>
-                <div>
-                  {preds[m.match_id].pre.team2_name} Elo:{" "}
-                  {Number(preds[m.match_id].pre.team2_rating).toFixed(1)}
-                </div>
-                <div>
-                  Confidence: {Number(preds[m.match_id].pre.confidence_score).toFixed(3)}
-                </div>
-
-                <div style={{ marginTop: 10 }}>
-                  <strong>Why this prediction?</strong>
-                  {preds[m.match_id].explanations?.length ? (
-                    <div style={{ marginTop: 6 }}>
-                      {preds[m.match_id].explanations.map((e: any) => (
-                        <div key={e.rank}>
-                          {e.rank}. {e.feature_name}: {Number(e.impact_value).toFixed(3)}
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div style={{ marginTop: 6 }}>No explanation available.</div>
-                  )}
-                </div>
-              </div>
+              <PredictionInsightPanel
+                prediction={preds[m.match_id].pre}
+                explanations={preds[m.match_id].explanations}
+              />
             )}
           </li>
         ))}

@@ -39,10 +39,13 @@ services:
       CRICKET_API_KEY: ${CRICKET_API_KEY:-}
       ODDS_API_KEY: ${ODDS_API_KEY:-}
       ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+      ODDS_SPORT_KEY: ${ODDS_SPORT_KEY:-cricket_ipl}
       # MLflow (optional)
       MLFLOW_TRACKING_URI: http://mlflow:5000
     ports:
       - "8000:8000"
+    volumes:
+      - ./ml/artifacts:/app/ml/artifacts:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -66,6 +69,7 @@ services:
       CRICKET_API_KEY: ${CRICKET_API_KEY:-}
       ODDS_API_KEY: ${ODDS_API_KEY:-}
       ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+      ODDS_SPORT_KEY: ${ODDS_SPORT_KEY:-cricket_ipl}
     depends_on:
       postgres:
         condition: service_healthy
@@ -113,6 +117,7 @@ services:
       CRICKET_API_KEY: ${CRICKET_API_KEY:-}
       ODDS_API_KEY: ${ODDS_API_KEY:-}
       ODDS_API_BASE_URL: ${ODDS_API_BASE_URL:-}
+      ODDS_SPORT_KEY: ${ODDS_SPORT_KEY:-cricket_ipl}
     depends_on:
       postgres:
         condition: service_healthy
